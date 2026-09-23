@@ -8,6 +8,7 @@ import AlarmModal from './components/AlarmModal';
 import BurnoutShield from './components/BurnoutShield';
 import MissedTasksModal from './components/MissedTasksModal';
 import PriorityTaskManager from './components/PriorityTaskManager';
+import NotificationSettings from './components/NotificationSettings';
 import { formatSeconds, parseTimeToMinutes, formatMinutesToTime } from './utils/time';
 
 const API_BASE_URL = '/api';
@@ -619,6 +620,15 @@ export default function App() {
         {/* --- ANALYTICS TAB --- */}
         {tab === 'analytics' && (
           <Analytics analytics={analytics} />
+        )}
+
+        {/* --- EMAIL ALERTS & NOTIFICATIONS TAB --- */}
+        {tab === 'notifications' && (
+          <NotificationSettings
+            user={user}
+            onUserUpdated={setUser}
+            apiCall={apiCall}
+          />
         )}
       </main>
 

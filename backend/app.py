@@ -5,20 +5,26 @@ import secrets
 import json
 import httpx
 import base64
+import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, status, Header, Depends, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List, Optional
 from dotenv import load_dotenv
 
+from mailer import send_verification_email, send_task_alert_email
+
 
 # Load environment variables from local .env file if it exists
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=BASE_DIR / ".env")
+
+def get_frontend_url():
+    return os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip("/")
 
 import threading
 
@@ -45,7 +51,10 @@ def init_db(conn):
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL
+            password TEXT NOT NULL,
+            email TEXT,
+            email_verified INTEGER DEFAULT 0,
+            email_verification_token TEXT
         );
         """)
         conn.execute("""
@@ -67,18 +76,35 @@ def init_db(conn):
             priority TEXT DEFAULT 'Medium',
             deadline TEXT,
             status TEXT DEFAULT 'Scheduled',
+            reminded_5m INTEGER DEFAULT 0,
+            reminded_start INTEGER DEFAULT 0,
+            snooze_token TEXT,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         );
         """)
         # Run column migration checks for existing SQLite database
-        try:
-            conn.execute("ALTER TABLE tasks ADD COLUMN priority TEXT DEFAULT 'Medium'")
-        except Exception:
-            pass
-        try:
-            conn.execute("ALTER TABLE tasks ADD COLUMN deadline TEXT")
-        except Exception:
-            pass
+        for col, col_def in [
+            ("email", "TEXT"),
+            ("email_verified", "INTEGER DEFAULT 0"),
+            ("email_verification_token", "TEXT")
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {col} {col_def}")
+            except Exception:
+                pass
+
+        for col, col_def in [
+            ("priority", "TEXT DEFAULT 'Medium'"),
+            ("deadline", "TEXT"),
+            ("reminded_5m", "INTEGER DEFAULT 0"),
+            ("reminded_start", "INTEGER DEFAULT 0"),
+            ("snooze_token", "TEXT")
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {col_def}")
+            except Exception:
+                pass
+
         conn.execute("""
         CREATE TABLE IF NOT EXISTS study_sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,8 +117,16 @@ def init_db(conn):
         """)
         # Create indexes to avoid full table scans and improve query latency
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_user_id ON tasks(user_id);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_snooze_token ON tasks(snooze_token);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_verif_token ON users(email_verification_token);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_study_sessions_user_id ON study_sessions(user_id);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id);")
+        
+        # Backfill any existing tasks without a snooze token
+        rows_missing_token = conn.execute("SELECT id FROM tasks WHERE snooze_token IS NULL OR snooze_token = ''").fetchall()
+        for r in rows_missing_token:
+            conn.execute("UPDATE tasks SET snooze_token = ? WHERE id = ?", (secrets.token_urlsafe(24), r["id"]))
+
         conn.commit()
 
 init_db(db_conn)
@@ -108,10 +142,89 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def check_and_send_task_reminders():
+    """
+    Checks for upcoming and starting tasks for users with verified emails,
+    sending 5-min pre-alerts and starting-now alerts with 1-click snooze links.
+    """
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    current_minutes = now.hour * 60 + now.minute
+
+    with db_lock:
+        rows = db_conn.execute("""
+            SELECT 
+                t.id, t.user_id, t.task_name, t.start_time, t.end_time, t.priority,
+                t.reminded_5m, t.reminded_start, t.snooze_token,
+                u.username, u.email
+            FROM tasks t
+            JOIN users u ON t.user_id = u.id
+            WHERE t.date_str = ?
+              AND t.status = 'Scheduled'
+              AND u.email_verified = 1
+              AND u.email IS NOT NULL
+              AND u.email != ''
+        """, (today_str,)).fetchall()
+
+    for r in rows:
+        task_id = r["id"]
+        start_time_str = r["start_time"]
+        start_mins = timestr_to_minutes(start_time_str)
+        reminded_5m = bool(r["reminded_5m"])
+        reminded_start = bool(r["reminded_start"])
+        email = r["email"]
+        username = r["username"]
+        snooze_token = r["snooze_token"]
+        if not snooze_token:
+            snooze_token = secrets.token_urlsafe(24)
+            with db_lock:
+                db_conn.execute("UPDATE tasks SET snooze_token = ? WHERE id = ?", (snooze_token, task_id))
+                db_conn.commit()
+
+        task_dict = {
+            "task_name": r["task_name"],
+            "start_time": r["start_time"],
+            "end_time": r["end_time"],
+            "priority": r["priority"],
+            "snooze_token": snooze_token
+        }
+
+        diff_minutes = start_mins - current_minutes
+
+        # 1. 5-minute pre-alert (within 1 to 5 minutes before start)
+        if 0 < diff_minutes <= 5 and not reminded_5m:
+            send_task_alert_email(email, username, task_dict, is_starting=False)
+            with db_lock:
+                db_conn.execute("UPDATE tasks SET reminded_5m = 1 WHERE id = ?", (task_id,))
+                db_conn.commit()
+
+        # 2. Starting-now alert (within 0 to -15 minutes past start)
+        elif -15 <= diff_minutes <= 0 and not reminded_start:
+            send_task_alert_email(email, username, task_dict, is_starting=True)
+            with db_lock:
+                db_conn.execute("UPDATE tasks SET reminded_start = 1 WHERE id = ?", (task_id,))
+                db_conn.commit()
+
+async def task_reminder_worker():
+    while True:
+        try:
+            check_and_send_task_reminders()
+        except Exception as e:
+            print(f"⚠️ Exception in background task reminder worker: {e}")
+        await asyncio.sleep(30)
+
+@app.on_event("startup")
+async def on_startup():
+    asyncio.create_task(task_reminder_worker())
+
 # ----------------- PYDANTIC SCHEMAS -----------------
 class UserAuth(BaseModel):
     username: str
     password: str
+    email: Optional[str] = None
+
+class EmailUpdate(BaseModel):
+    email: str
 
 class TaskCreate(BaseModel):
     date_str: str
@@ -168,22 +281,39 @@ def register(user: UserAuth):
     hash_b64 = base64.b64encode(hash_bytes).decode("utf-8")
     stored_password = f"{salt_b64}:{hash_b64}"
 
+    clean_email = user.email.strip().lower() if user.email and user.email.strip() else None
+    email_token = secrets.token_urlsafe(32) if clean_email else None
+
     with db_lock:
         try:
             cursor = db_conn.execute(
-                "INSERT INTO users (username, password) VALUES (?, ?)",
-                (user.username, stored_password)
+                "INSERT INTO users (username, password, email, email_verified, email_verification_token) VALUES (?, ?, ?, 0, ?)",
+                (user.username, stored_password, clean_email, email_token)
             )
             db_conn.commit()
-            return {"id": cursor.lastrowid, "username": user.username}
+            new_id = cursor.lastrowid
         except sqlite3.IntegrityError:
             raise HTTPException(status_code=400, detail="Username already exists")
+
+    if clean_email and email_token:
+        try:
+            send_verification_email(clean_email, user.username, email_token)
+        except Exception as e:
+            print(f"Failed to dispatch verification email on register: {e}")
+
+    return {
+        "id": new_id,
+        "username": user.username,
+        "email": clean_email,
+        "email_verified": False,
+        "message": "Account created successfully" + ("! Verification email sent." if clean_email else ".")
+    }
 
 @app.post("/api/auth/login")
 def login(user: UserAuth):
     with db_lock:
         row = db_conn.execute(
-            "SELECT id, username, password FROM users WHERE username = ?",
+            "SELECT id, username, password, email, email_verified FROM users WHERE username = ?",
             (user.username,)
         ).fetchone()
     
@@ -212,6 +342,13 @@ def login(user: UserAuth):
     if not is_valid:
         raise HTTPException(status_code=401, detail="Invalid username or password")
     
+    # Enforce email verification if an email is registered
+    if row["email"] and not bool(row["email_verified"]):
+        raise HTTPException(
+            status_code=403,
+            detail="Please verify your email before logging in! Check your inbox or spam folder for the confirmation link."
+        )
+    
     user_id = row["id"]
     token = secrets.token_urlsafe(32)
     with db_lock:
@@ -220,15 +357,151 @@ def login(user: UserAuth):
             (token, user_id)
         )
         db_conn.commit()
-    return {"id": user_id, "username": row["username"], "token": token}
+    return {
+        "id": user_id,
+        "username": row["username"],
+        "email": row["email"],
+        "email_verified": bool(row["email_verified"]),
+        "token": token
+    }
 
 @app.get("/api/auth/me")
 def get_me(user_id: int = Depends(get_current_user_id)):
     with db_lock:
-        row = db_conn.execute("SELECT id, username FROM users WHERE id = ?", (user_id,)).fetchone()
+        row = db_conn.execute("SELECT id, username, email, email_verified FROM users WHERE id = ?", (user_id,)).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="User not found")
-    return dict(row)
+    data = dict(row)
+    data["email_verified"] = bool(data.get("email_verified", 0))
+    return data
+
+@app.post("/api/user/email")
+def update_user_email(payload: EmailUpdate, user_id: int = Depends(get_current_user_id)):
+    clean_email = payload.email.strip().lower()
+    if not clean_email or "@" not in clean_email:
+        raise HTTPException(status_code=400, detail="Please provide a valid email address.")
+
+    token = secrets.token_urlsafe(32)
+    with db_lock:
+        row = db_conn.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
+        username = row["username"]
+
+        db_conn.execute(
+            "UPDATE users SET email = ?, email_verified = 0, email_verification_token = ? WHERE id = ?",
+            (clean_email, token, user_id)
+        )
+        db_conn.commit()
+
+    send_verification_email(clean_email, username, token)
+    return {"message": "Email updated! Verification email sent.", "email": clean_email, "email_verified": False}
+
+@app.post("/api/user/resend-verification")
+def resend_verification(user_id: int = Depends(get_current_user_id)):
+    with db_lock:
+        row = db_conn.execute("SELECT username, email, email_verified, email_verification_token FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
+        if not row["email"]:
+            raise HTTPException(status_code=400, detail="No email configured for this account.")
+        if row["email_verified"]:
+            return {"message": "Email is already verified!"}
+
+        token = row["email_verification_token"]
+        if not token:
+            token = secrets.token_urlsafe(32)
+            db_conn.execute("UPDATE users SET email_verification_token = ? WHERE id = ?", (token, user_id))
+            db_conn.commit()
+
+    send_verification_email(row["email"], row["username"], token)
+    return {"message": "Verification email resent successfully!"}
+
+class PublicResendPayload(BaseModel):
+    username: str
+
+@app.post("/api/auth/resend-verification")
+def public_resend_verification(payload: PublicResendPayload):
+    with db_lock:
+        row = db_conn.execute(
+            "SELECT username, email, email_verified, email_verification_token FROM users WHERE username = ?", 
+            (payload.username.strip(),)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Username not found.")
+        if not row["email"]:
+            raise HTTPException(status_code=400, detail="No email configured for this account.")
+        if bool(row["email_verified"]):
+            return {"message": "Email is already verified! Please log in."}
+
+        token = row["email_verification_token"]
+        if not token:
+            token = secrets.token_urlsafe(32)
+            db_conn.execute("UPDATE users SET email_verification_token = ? WHERE username = ?", (token, payload.username.strip()))
+            db_conn.commit()
+
+    send_verification_email(row["email"], row["username"], token)
+    return {"message": f"Verification email sent to {row['email']}! Please check inbox and spam folder."}
+
+@app.get("/api/auth/verify-email", response_class=HTMLResponse)
+def verify_email(token: str):
+    if not token or len(token) < 10:
+        return HTMLResponse(
+            status_code=400,
+            content="""
+            <html><body style="font-family: sans-serif; text-align: center; padding: 50px; background: #f8fafc;">
+            <div style="max-width: 480px; margin: auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
+              <h2 style="color: #ef4444;">❌ Invalid Verification Link</h2>
+              <p>This verification link is invalid or has expired.</p>
+            </div></body></html>
+            """
+        )
+
+    with db_lock:
+        row = db_conn.execute("SELECT id, username, email FROM users WHERE email_verification_token = ?", (token,)).fetchone()
+        if not row:
+            return HTMLResponse(
+                status_code=404,
+                content="""
+                <html><body style="font-family: sans-serif; text-align: center; padding: 50px; background: #f8fafc;">
+                <div style="max-width: 480px; margin: auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
+                  <h2 style="color: #ef4444;">❌ Token Expired or Already Verified</h2>
+                  <p>This link is no longer valid. Your email may already be verified.</p>
+                </div></body></html>
+                """
+            )
+
+        db_conn.execute("UPDATE users SET email_verified = 1, email_verification_token = NULL WHERE id = ?", (row["id"],))
+        db_conn.commit()
+
+    return HTMLResponse(
+        content=f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="utf-8">
+          <title>Email Verified - Smart Study Scheduler</title>
+          <style>
+            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f1f5f9; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }}
+            .card {{ background: #ffffff; padding: 40px; border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.08); text-align: center; max-width: 440px; border: 1px solid #e2e8f0; }}
+            .icon {{ font-size: 56px; margin-bottom: 16px; }}
+            h1 {{ font-size: 24px; color: #0f172a; margin: 0 0 12px 0; }}
+            p {{ color: #475569; font-size: 15px; line-height: 1.6; margin: 0 0 24px 0; }}
+            .btn {{ display: inline-block; background: #4f46e5; color: white; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; font-size: 14px; }}
+            .btn:hover {{ background: #4338ca; }}
+          </style>
+        </head>
+        <body>
+          <div class="card">
+            <div class="icon">✅</div>
+            <h1>Email Successfully Verified!</h1>
+            <p>Welcome, <strong>{row['username']}</strong>! Your email (<code>{row['email']}</code>) is now confirmed. You will receive automated 5-minute pre-alerts and task starting alerts with 1-click snooze links.</p>
+            <a href="/" class="btn">Go to Study Scheduler</a>
+          </div>
+        </body>
+        </html>
+        """
+    )
 
 # ----------------- TASKS / TIMETABLE ENDPOINTS -----------------
 @app.get("/api/tasks")
@@ -240,19 +513,174 @@ def get_tasks(user_id: int = Depends(get_current_user_id)):
         ).fetchall()
     return [dict(r) for r in rows]
 
+def timestr_to_minutes(time_str: str) -> int:
+    try:
+        parts = time_str.strip().split(":")
+        return int(parts[0]) * 60 + int(parts[1])
+    except Exception:
+        return 0
+
+def minutes_to_timestr(total_mins: int) -> str:
+    total_mins = total_mins % 1440
+    hours = total_mins // 60
+    mins = total_mins % 60
+    return f"{hours:02d}:{mins:02d}"
+
 @app.post("/api/tasks", status_code=status.HTTP_201_CREATED)
 def create_task(task: TaskCreate, user_id: int = Depends(get_current_user_id)):
     priority = task.priority if task.priority in ["High", "Medium", "Low"] else "Medium"
+    snooze_token = secrets.token_urlsafe(24)
     with db_lock:
         cursor = db_conn.execute(
             """
-            INSERT INTO tasks (user_id, date_str, start_time, end_time, task_name, priority, deadline, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'Scheduled')
+            INSERT INTO tasks (user_id, date_str, start_time, end_time, task_name, priority, deadline, status, reminded_5m, reminded_start, snooze_token)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'Scheduled', 0, 0, ?)
             """,
-            (user_id, task.date_str, task.start_time, task.end_time, task.task_name, priority, task.deadline)
+            (user_id, task.date_str, task.start_time, task.end_time, task.task_name, priority, task.deadline, snooze_token)
         )
         db_conn.commit()
-    return {**task.dict(), "id": cursor.lastrowid, "user_id": user_id, "priority": priority, "status": "Scheduled"}
+    return {
+        **task.dict(),
+        "id": cursor.lastrowid,
+        "user_id": user_id,
+        "priority": priority,
+        "status": "Scheduled",
+        "snooze_token": snooze_token
+    }
+
+# ----------------- 1-CLICK EMAIL ACTION ENDPOINTS -----------------
+@app.get("/api/tasks/snooze", response_class=HTMLResponse)
+def snooze_task_from_email(token: str, mins: int = 15):
+    if not token or len(token) < 10:
+        return HTMLResponse(
+            status_code=400,
+            content="""
+            <html><body style="font-family: sans-serif; text-align: center; padding: 50px; background: #f8fafc;">
+            <div style="max-width: 480px; margin: auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
+              <h2 style="color: #ef4444;">❌ Invalid Snooze Link</h2>
+              <p>The snooze link provided is invalid.</p>
+            </div></body></html>
+            """
+        )
+    
+    mins = max(5, min(mins, 180)) # Allow snoozing between 5 to 180 minutes
+
+    with db_lock:
+        task = db_conn.execute("SELECT * FROM tasks WHERE snooze_token = ?", (token,)).fetchone()
+        if not task:
+            return HTMLResponse(
+                status_code=404,
+                content="""
+                <html><body style="font-family: sans-serif; text-align: center; padding: 50px; background: #f8fafc;">
+                <div style="max-width: 480px; margin: auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
+                  <h2 style="color: #ef4444;">❌ Task Not Found</h2>
+                  <p>This task may have been removed or already modified.</p>
+                </div></body></html>
+                """
+            )
+        
+        old_start = task["start_time"]
+        old_end = task["end_time"]
+        start_mins = timestr_to_minutes(old_start) + mins
+        end_mins = timestr_to_minutes(old_end) + mins
+
+        new_start = minutes_to_timestr(start_mins)
+        new_end = minutes_to_timestr(end_mins)
+
+        # Reset reminder flags so the user gets notified for the new snoozed time!
+        db_conn.execute(
+            """
+            UPDATE tasks 
+            SET start_time = ?, end_time = ?, reminded_5m = 0, reminded_start = 0 
+            WHERE id = ?
+            """,
+            (new_start, new_end, task["id"])
+        )
+        db_conn.commit()
+
+    return HTMLResponse(
+        content=f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="utf-8">
+          <title>Task Rescheduled - Smart Study Scheduler</title>
+          <style>
+            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f1f5f9; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; }}
+            .card {{ background: #ffffff; padding: 36px; border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.08); text-align: center; max-width: 460px; width: 100%; border: 1px solid #e2e8f0; }}
+            .icon {{ font-size: 50px; margin-bottom: 12px; }}
+            h1 {{ font-size: 22px; color: #0f172a; margin: 0 0 12px 0; }}
+            p {{ color: #475569; font-size: 15px; line-height: 1.5; margin: 0 0 20px 0; }}
+            .time-box {{ background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 10px; padding: 14px; margin: 16px 0; }}
+            .time-row {{ display: flex; justify-content: space-between; font-size: 14px; padding: 4px 0; }}
+            .time-row strong {{ color: #1e293b; }}
+            .badge-success {{ display: inline-block; background-color: #ecfdf5; color: #059669; border: 1px solid #a7f3d0; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; margin-top: 10px; }}
+            .btn {{ display: inline-block; background: #4f46e5; color: white; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; font-size: 14px; margin-top: 20px; }}
+            .btn:hover {{ background: #4338ca; }}
+          </style>
+        </head>
+        <body>
+          <div class="card">
+            <div class="icon">⏰</div>
+            <h1>Task Rescheduled!</h1>
+            <p><strong>{task['task_name']}</strong> has been snoozed by <strong>{mins} minutes</strong>.</p>
+            
+            <div class="time-box">
+              <div class="time-row"><span>Previous Time:</span> <span>{old_start} - {old_end}</span></div>
+              <div class="time-row"><span>New Time:</span> <strong>{new_start} - {new_end}</strong></div>
+            </div>
+
+            <div class="badge-success">🔔 Email alerts re-armed for the new schedule!</div>
+
+            <div>
+              <a href="/" class="btn">View Study Dashboard</a>
+            </div>
+          </div>
+        </body>
+        </html>
+        """
+    )
+
+@app.get("/api/tasks/complete-from-email", response_class=HTMLResponse)
+def complete_task_from_email(token: str):
+    if not token or len(token) < 10:
+        return HTMLResponse(status_code=400, content="Invalid link")
+
+    with db_lock:
+        task = db_conn.execute("SELECT * FROM tasks WHERE snooze_token = ?", (token,)).fetchone()
+        if not task:
+            return HTMLResponse(status_code=404, content="Task not found")
+
+        db_conn.execute("UPDATE tasks SET status = 'Completed' WHERE id = ?", (task["id"],))
+        db_conn.commit()
+
+    return HTMLResponse(
+        content=f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="utf-8">
+          <title>Task Completed - Smart Study Scheduler</title>
+          <style>
+            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f1f5f9; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }}
+            .card {{ background: #ffffff; padding: 36px; border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.08); text-align: center; max-width: 440px; border: 1px solid #e2e8f0; }}
+            .icon {{ font-size: 50px; margin-bottom: 12px; }}
+            h1 {{ font-size: 22px; color: #0f172a; margin: 0 0 12px 0; }}
+            p {{ color: #475569; font-size: 15px; margin: 0 0 20px 0; }}
+            .btn {{ display: inline-block; background: #10b981; color: white; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; font-size: 14px; }}
+          </style>
+        </head>
+        <body>
+          <div class="card">
+            <div class="icon">🎉</div>
+            <h1>Great Job!</h1>
+            <p><strong>{task['task_name']}</strong> has been marked as <strong>Completed</strong>.</p>
+            <a href="/" class="btn">Back to App</a>
+          </div>
+        </body>
+        </html>
+        """
+    )
 
 @app.put("/api/tasks/batch")
 def batch_update_tasks(updates: List[TaskBatchUpdate], user_id: int = Depends(get_current_user_id)):

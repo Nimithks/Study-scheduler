@@ -36,6 +36,12 @@ export default function Navbar({
         >
           Analytics Dashboard
         </button>
+        <button 
+          className={`nav-btn ${tab === 'notifications' ? 'active' : ''}`} 
+          onClick={() => setTab('notifications')}
+        >
+          🔔 Email Alerts {user?.email && (user.email_verified ? '🟢' : '🟡')}
+        </button>
         <button className="nav-btn btn-danger-text" onClick={handleLogout}>Log Out</button>
       </nav>
     </header>
