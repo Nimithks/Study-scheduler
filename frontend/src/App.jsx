@@ -50,7 +50,7 @@ export default function App() {
   const [apiError, setApiError] = useState(null);
 
   // --- MISSED TASKS RESCHEDULING ENGINE ---
-  const calculateMissedReschedule = (taskList, applyCompression = false, compressionFactor = 1, currentCompressionCount = 0) => {
+  const calculateMissedReschedule = (taskList, applyCompression = false, compressionFactor = 2, currentCompressionCount = 0) => {
     const now = new Date();
     const currentTodayStr = now.toISOString().split('T')[0];
     const currentMinutes = now.getHours() * 60 + now.getMinutes();
